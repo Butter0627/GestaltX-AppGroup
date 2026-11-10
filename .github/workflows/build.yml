@@ -34,7 +34,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: xcode-27
+    runs-on: macos-15
     timeout-minutes: 40
     env:
       REF: ${{ github.event.release.tag_name || inputs.ref || github.ref }}
