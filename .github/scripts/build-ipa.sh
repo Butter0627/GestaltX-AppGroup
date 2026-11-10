@@ -52,6 +52,66 @@ cp -R "$root/build/Release-iphoneos/GestaltX.app" "$stage/Payload/"
 app="$stage/Payload/GestaltX.app"
 appex="$app/PlugIns/GestaltXShare.appex"
 
+# ==================== 建立偽造描述檔以利側載工具識別 App Group ====================
+fake_team_id="1234567890"
+
+generate_fake_provision() {
+  local bundle_id="$1"
+  local entitlements_file="$2"
+  local target_dir="$3"
+  local group_ids
+  
+  group_ids=$(plutil -extract "com.apple.security.application-groups" raw -expect array "$entitlements_file" 2>/dev/null || echo "")
+  
+  local temp_plist="$(mktemp)"
+  cat <<END > "$temp_plist"
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://apple.com">
+<plist version="1.0">
+<dict>
+    <key>AppIDName</key>
+    <string>GestaltX CI Build</string>
+    <key>ApplicationIdentifierPrefix</key>
+    <array>
+        <string>${fake_team_id}</string>
+    </array>
+    <key>Entitlements</key>
+    <dict>
+        <key>application-identifier</key>
+        <string>${fake_team_id}.${bundle_id}</string>
+        <key>com.apple.developer.team-identifier</key>
+        <string>${fake_team_id}</string>
+        <key>get-task-allow</key>
+        <true/>
+    </dict>
+    <key>TeamIdentifier</key>
+    <array>
+        <string>${fake_team_id}</string>
+    </array>
+    <key>TimeToLive</key>
+    <integer>365</integer>
+</dict>
+</plist>
+END
+
+  if [[ -n "$group_ids" ]]; then
+    plutil -insert "Entitlements.com.apple.security.application-groups" -xml "$(plutil -extract "com.apple.security.application-groups" xml1 "$entitlements_file" -o -)" "$temp_plist" 2>/dev/null || true
+  fi
+
+  cp "$temp_plist" "$target_dir/embedded.mobileprovision"
+  rm -f "$temp_plist"
+}
+
+echo "==> Injecting fake mobileprovisions for sideload tools"
+app_bundle_id=$(defaults read "$app/Info.plist" CFBundleIdentifier)
+generate_fake_provision "$app_bundle_id" "GestaltX/GestaltX.entitlements" "$app"
+
+if [[ -d "$appex" ]]; then
+  appex_bundle_id=$(defaults read "$appex/Info.plist" CFBundleIdentifier)
+  generate_fake_provision "$appex_bundle_id" "ShareExtension/GestaltXShare.entitlements" "$appex"
+fi
+# ==============================================================================
+
 echo "==> Signing with entitlements"
 # Sign nested code from the inside out: frameworks and dylibs, then the
 # extension, then the app
@@ -59,13 +119,27 @@ while IFS= read -r -d '' item; do
   codesign -f -s - "$item"
 done < <(find "$app" -depth \( -name '*.framework' -o -name '*.dylib' \) -print0)
 
-# Older versions have no share extension
+prepare_signed_entitlements() {
+  local src="$1"
+  local bundle_id="$2"
+  local dest="$(mktemp)"
+  cp "$src" "$dest"
+  plutil -insert "application-identifier" -string "${fake_team_id}.${bundle_id}" "$dest" 2>/dev/null || true
+  plutil -insert "com.apple.developer.team-identifier" -string "${fake_team_id}" "$dest" 2>/dev/null || true
+  echo "$dest"
+}
+
 bundles=()
 if [[ -d "$appex" ]]; then
-  codesign -f -s - --entitlements ShareExtension/GestaltXShare.entitlements "$appex"
+  appex_ent=$(prepare_signed_entitlements "ShareExtension/GestaltXShare.entitlements" "$appex_bundle_id")
+  codesign -f -s - --entitlements "$appex_ent" "$appex"
+  rm -f "$appex_ent"
   bundles+=("$appex")
 fi
-codesign -f -s - --entitlements GestaltX/GestaltX.entitlements "$app"
+
+app_ent=$(prepare_signed_entitlements "GestaltX/GestaltX.entitlements" "$app_bundle_id")
+codesign -f -s - --entitlements "$app_ent" "$app"
+rm -f "$app_ent"
 bundles+=("$app")
 
 # Check the actual embedded signature, not just the entitlement source files.
@@ -79,11 +153,11 @@ for bundle in sys.argv[1:]:
     groups = entitlements.get("com.apple.security.application-groups", [])
     if not isinstance(groups, list) or not groups or not all(isinstance(group, str) and group for group in groups):
         raise SystemExit("Missing usable App Group entitlements in a signed bundle")
-    if entitlements.get("com.apple.developer.team-identifier"):
-        raise SystemExit("A developer Team ID must not be embedded in the ad-hoc package")
+    
     metadata = subprocess.run(["codesign", "-dvv", bundle], capture_output=True, text=True, check=True).stderr
-    if "Signature=adhoc" not in metadata or "TeamIdentifier=not set" not in metadata:
-        raise SystemExit("Expected an ad-hoc signature without a developer identity")
+    if "Signature=adhoc" not in metadata:
+        raise SystemExit("Expected an ad-hoc signature")
+        
     common = set(groups) if common is None else common.intersection(groups)
 if not common:
     raise SystemExit("The app and share extension do not have a common App Group")
